@@ -14,21 +14,21 @@ app.post('/webhook/freshchat', async (req, res) => {
   const message = event?.data?.message || {};
   const partes = message?.message_parts || [];
   const texto = partes?.[0]?.text?.content || '(sin texto)';
-  const convId = message?.freshchat_conversation_id || '(sin conv_id)';
-  const canalId = message?.freshchat_channel_id || '(sin canal_id)';
   const tipoMensaje = message?.message_type || '(sin tipo)';
-  const actorId = message?.actor_id || '(sin actor_id)';
+
+  // 👇 lógica de descarte clara y precisa
+  const esPrivadoDeAgente = (actorType === 'agent' && tipoMensaje === 'private');
 
   console.log(`📥 Evento recibido @ ${now}`);
   console.log(`🧑‍🎤 Actor tipo: ${actorType}`);
-  console.log(`💬 Texto: ${texto}`);
   console.log(`💬 Tipo mensaje: ${tipoMensaje}`);
-  console.log(`🧾 actor_id: ${actorId}`);
-  console.log(`📡 freshchat_channel_id: ${canalId}`);
-  console.log(`💬 freshchat_conversation_id: ${convId}`);
-  console.log(`📦 Payload completo:\n${JSON.stringify(event, null, 2)}`);
+  console.log(`💬 Texto: ${texto}`);
 
-  // No filtra nada aún
+  if (esPrivadoDeAgente) {
+    console.log('🚫 Mensaje privado de agente descartado');
+    return res.sendStatus(200);
+  }
+
   try {
     await axios.post(BOTPRESS_URL, event);
     console.log('✅ Evento reenviado a Botpress\n');
@@ -40,7 +40,7 @@ app.post('/webhook/freshchat', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.send('Filtro operativo ✅ (modo diagnóstico)');
+  res.send('Filtro operativo ✅');
 });
 
 app.listen(3000, () => {
