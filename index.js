@@ -1,5 +1,6 @@
-const express = require('express');
-const axios = require('axios');
+import express from 'express';
+import axios from 'axios';
+
 const app = express();
 app.use(express.json());
 
@@ -23,4 +24,4 @@ app.post('/webhook/freshchat', async (req, res) => {
 });
 
 app.get('/', (req, res) => res.send('Filtro operativo ✅'));
-app.listen(3000, () => console.log('Filtro en puerto 3000'));
+app.listen(3000, () => console.log('Servidor en puerto 3000'));
