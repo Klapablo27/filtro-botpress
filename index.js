@@ -6,40 +6,67 @@ app.use(express.json());
 
 const BOTPRESS_URL = process.env.BOTPRESS_URL;
 
+// → aquí guardamos las conversaciones Freshchat que SÍ deben pasar
+const allowList = new Set();
+
 /**
- * Reenvía a Botpress solo:
- *   • actor_type = 'user'    (mensajes del cliente)
- *   • actor_type = 'agent' && message_type = 'normal'  (mensajes públicos del ejecutivo)
- * Todo lo demás (p.e. notas privadas del agente) se descarta.
+ * Decide si este evento habilita la conversación
  */
+function esSemilla(event) {
+  const msg   = event?.data?.message || {};
+  const actor = event?.actor?.actor_type;
+  const txt   = msg?.message_parts?.[0]?.text?.content || '';
+  return (
+    actor === 'user' &&
+    txt.includes('New Conversation Started') &&
+    msg.freshchat_conversation_id
+  );
+}
+
+/**
+ * Devuelve true si este evento pertenece a una conversación ya autorizada
+ */
+function autorizada(event) {
+  const id = event?.data?.message?.freshchat_conversation_id;
+  return id && allowList.has(id);
+}
+
 app.post('/webhook/freshchat', async (req, res) => {
-  const ev   = req.body;
-  const now  = new Date().toISOString();
+  const ev     = req.body;
+  const actor  = ev?.actor?.actor_type;
+  const msg    = ev?.data?.message || {};
+  const type   = msg.message_type || 'normal';
+  const idConv = msg.freshchat_conversation_id;
 
-  const actor = ev?.actor?.actor_type || 'sin_actor';
-  const msg   = ev?.data?.message     || {};
-  const type  = msg.message_type      || 'normal';
-  const text  = msg?.message_parts?.[0]?.text?.content?.trim() || '(sin texto)';
+  // 1️⃣  ¿Es semilla? → autorizar conversación
+  if (esSemilla(ev)) {
+    allowList.add(idConv);
+    console.log('🌱 Semilla detectada; autorizo conv', idConv);
+  }
 
-  const esUsuario        = actor === 'user';
-  const esAgentePublico  = actor === 'agent' && type === 'normal';
-
-  console.log(`📥 ${now} • actor:${actor} • tipo:${type} • txt:${text.slice(0,60)}`);
-
-  if (!(esUsuario || esAgentePublico)) {
-    console.log('🚫  Descartado (privado/sistema)\n');
+  // 2️⃣  ¿Pertenece a conversación autorizada?
+  if (!autorizada(ev)) {
+    console.log('🚫 Descarto por conversación no autorizada', idConv);
     return res.sendStatus(200);
   }
 
+  // 3️⃣  Descartar notas privadas del agente
+  const esPrivadoAgente = actor === 'agent' && type === 'private';
+  if (esPrivadoAgente) {
+    console.log('🚫 Nota privada descartada');
+    return res.sendStatus(200);
+  }
+
+  // 4️⃣  Reenviar a Botpress
   try {
     await axios.post(BOTPRESS_URL, ev);
-    console.log('✅  Reenviado a Botpress\n');
+    console.log('✅ Reenviado', { actor, type, idConv });
     res.sendStatus(200);
-  } catch (err) {
-    console.error('❌  Error reenviando:', err.message);
+  } catch (e) {
+    console.error('❌ Error reenviando:', e.message);
     res.sendStatus(500);
   }
 });
 
 app.get('/', (_, res) => res.send('Filtro operativo ✅'));
-app.listen(3000, () => console.log('🚀  Servidor en puerto 3000'));
+app.listen(3000, () => console.log('🚀 Proxy Freshchat → Botpress en puerto 3000'));
