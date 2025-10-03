@@ -9,34 +9,15 @@ const BOTPRESS_URL = process.env.BOTPRESS_URL;
 /* Lista en memoria de conversaciones Freshchat autorizadas */
 const allowList = new Set();
 
-/* ───────────── logging helper ───────────── */
-function isResolutionAction(ev) {
-  const action = ev?.action || '';
-  const status =
-    ev?.data?.conversation?.status ||
-    ev?.data?.status ||
-    ev?.data?.conversation_status ||
-    null;
-
-  return (
-    action === 'conversation_resolution' ||
-    action === 'conversation_resolved'  ||
-    action === 'conversation_close'     ||
-    (action === 'conversation_update' && (status === 'resolved' || status === 'closed'))
-  );
-}
-
-/* Log de todas las requests (método/ruta) */
-app.use((req, _res, next) => {
-  console.log(`➡️  ${req.method} ${req.url}`);
-  next();
-});
-
 /* ───────────────── utilidades ───────────────── */
 function getConvId(ev) {
   return (
     ev?.data?.message?.freshchat_conversation_id ||
+    ev?.data?.message?.conversation_id ||                              // extra
     ev?.data?.conversation?.id ||
+    ev?.data?.conversation?.conversation_id ||                         // extra
+    ev?.data?.resolve?.conversation?.conversation_id ||                // ← cierre (tu payload)
+    ev?.data?.reopen?.conversation?.conversation_id ||                 // extra
     null
   );
 }
@@ -51,6 +32,23 @@ function esSemilla(ev) {
   );
 }
 
+/* Detectar evento de cierre/resolución */
+function esCierre(ev) {
+  const a = ev?.action || '';
+  const status =
+    ev?.data?.conversation?.status ||
+    ev?.data?.status ||
+    ev?.data?.resolve?.conversation?.status ||
+    null;
+
+  return (
+    a === 'conversation_resolution' ||
+    a === 'conversation_resolved'  ||
+    a === 'conversation_close'     ||
+    (a === 'conversation_update' && (status === 'resolved' || status === 'closed'))
+  );
+}
+
 /* ───────────────── webhook ───────────────── */
 app.post('/webhook/freshchat', async (req, res) => {
   const ev = req.body;
@@ -59,27 +57,11 @@ app.post('/webhook/freshchat', async (req, res) => {
   const typeMsg = msg.message_type || 'normal';
   const action = ev?.action;
   const idConv = getConvId(ev);
-  const status =
-    ev?.data?.conversation?.status ||
-    ev?.data?.status ||
-    ev?.data?.conversation_status ||
-    null;
-
-  console.log('🛰️  Incoming event:', { action, actor, typeMsg, idConv, status });
-
-  /* Si parece evento de cierre, loguea payload completo para inspección */
-  if (isResolutionAction(ev)) {
-    try {
-      console.log('🧾  Payload (posible cierre):\n' + JSON.stringify(ev, null, 2));
-    } catch {
-      console.log('🧾  Payload (posible cierre): <no serializable>');
-    }
-  }
 
   /* 1. Semilla → autoriza conversación */
   if (esSemilla(ev) && idConv) {
     allowList.add(idConv);
-    console.log('🌱  Semilla; autorizo conv', idConv);
+    console.log('🌱 Semilla; autorizo conv', idConv);
   }
 
   /* 2. Ver si la conversación está autorizada */
@@ -87,29 +69,33 @@ app.post('/webhook/freshchat', async (req, res) => {
 
   /* Permitir eventos de estado (conversation_update / _status) si la conv ya fue autorizada */
   const esEventoEstado = autorizada && action?.startsWith('conversation_');
-  if (esEventoEstado) {
-    console.log('ℹ️  Evento de estado permitido por estar autorizada:', action, idConv);
-  }
 
-  if (!autorizada && !esEventoEstado) {
-    console.log('🚫  Descarto: conv no autorizada', { idConv, action, status });
+  /* Permitir SIEMPRE el cierre, aunque la conv no esté autorizada (p.ej. reinicio del servicio) */
+  const cierre = esCierre(ev);
+  if (!autorizada && !esEventoEstado && !cierre) {
+    console.log('🚫 Descarto: conv no autorizada', idConv);
     return res.sendStatus(200);
   }
 
-  /* 3. Bloquear nota privada del agente */
+  /* Si es cierre, limpia la allowList (opcional, buena higiene) */
+  if (cierre && idConv) {
+    allowList.delete(idConv);
+    console.log('🧹 Cierre detectado; borro de allowList', idConv);
+  }
+
+  /* 3. Bloquear nota privada del agente (no afecta mensajes normales al usuario) */
   if (actor === 'agent' && typeMsg === 'private') {
-    console.log('🚫  Nota privada descartada', { idConv, action });
+    console.log('🚫 Nota privada descartada');
     return res.sendStatus(200);
   }
 
   /* 4. Reenviar a Botpress */
   try {
-    console.log('➡️  Reenviando a Botpress...', { BOTPRESS_URL_present: !!BOTPRESS_URL, idConv, action });
     await axios.post(BOTPRESS_URL, ev);
-    console.log('✅  Reenviado', { idConv, actor, typeMsg, action, status });
+    console.log('✅ Reenviado', { idConv, actor, typeMsg, action });
     res.sendStatus(200);
   } catch (e) {
-    console.error('❌  Error al reenviar:', e?.message || e, { idConv, action });
+    console.error('❌ Error al reenviar:', e.message);
     res.sendStatus(500);
   }
 });
@@ -118,5 +104,5 @@ app.post('/webhook/freshchat', async (req, res) => {
 app.get('/', (_, res) => res.send('Filtro operativo ✅'));
 
 app.listen(3000, () =>
-  console.log('🚀  Proxy Freshchat → Botpress escuchando en 3000')
+  console.log('🚀 Proxy Freshchat → Botpress escuchando en 3000')
 );
