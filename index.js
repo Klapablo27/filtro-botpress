@@ -6,44 +6,22 @@ app.use(express.json());
 
 const BOTPRESS_URL = process.env.BOTPRESS_URL;
 
+/* ⬇️ Opcional: restringe por canal y/o grupo de Freshchat (coma-separados) */
+const allowedChannels = new Set(
+  (process.env.ALLOWED_CHANNEL_IDS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+);
+const allowedGroups = new Set(
+  (process.env.ALLOWED_GROUP_IDS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+);
+
 /* Lista en memoria de conversaciones Freshchat autorizadas */
 const allowList = new Set();
-
-/* ───────────── helpers de logging ───────────── */
-function getStatus(ev) {
-  return (
-    ev?.data?.conversation?.status ||
-    ev?.data?.status ||
-    ev?.data?.resolve?.conversation?.status ||
-    null
-  );
-}
-function getChannelId(ev) {
-  return (
-    ev?.data?.message?.channel_id ||
-    ev?.data?.conversation?.channel_id ||
-    ev?.data?.resolve?.conversation?.channel_id ||
-    null
-  );
-}
-function getAssignedGroupId(ev) {
-  return (
-    ev?.data?.resolve?.conversation?.assigned_group_id ||
-    ev?.data?.conversation?.assigned_group_id ||
-    null
-  );
-}
-
-/* Log de toda request que entra (método, ruta y headers clave) */
-app.use((req, _res, next) => {
-  console.log(`➡️  ${req.method} ${req.url}`);
-  console.log('   headers:', {
-    'content-type': req.headers['content-type'],
-    'x-freshchat-signature': !!req.headers['x-freshchat-signature'],
-    'user-agent': req.headers['user-agent'],
-  });
-  next();
-});
 
 /* ───────────────── utilidades ───────────────── */
 function getConvId(ev) {
@@ -52,8 +30,25 @@ function getConvId(ev) {
     ev?.data?.message?.conversation_id ||                              // extra
     ev?.data?.conversation?.id ||
     ev?.data?.conversation?.conversation_id ||                         // extra
-    ev?.data?.resolve?.conversation?.conversation_id ||                // ← cierre (tu payload)
+    ev?.data?.resolve?.conversation?.conversation_id ||                // cierre
     ev?.data?.reopen?.conversation?.conversation_id ||                 // extra
+    null
+  );
+}
+
+function getChannelId(ev) {
+  return (
+    ev?.data?.message?.channel_id ||
+    ev?.data?.conversation?.channel_id ||
+    ev?.data?.resolve?.conversation?.channel_id ||                     // cierre
+    null
+  );
+}
+
+function getAssignedGroupId(ev) {
+  return (
+    ev?.data?.resolve?.conversation?.assigned_group_id ||              // cierre
+    ev?.data?.conversation?.assigned_group_id ||
     null
   );
 }
@@ -71,7 +66,12 @@ function esSemilla(ev) {
 /* Detectar evento de cierre/resolución */
 function esCierre(ev) {
   const a = ev?.action || '';
-  const status = getStatus(ev);
+  const status =
+    ev?.data?.conversation?.status ||
+    ev?.data?.status ||
+    ev?.data?.resolve?.conversation?.status ||
+    null;
+
   return (
     a === 'conversation_resolution' ||
     a === 'conversation_resolved'  ||
@@ -82,77 +82,75 @@ function esCierre(ev) {
 
 /* ───────────────── webhook ───────────────── */
 app.post('/webhook/freshchat', async (req, res) => {
-  const t0 = Date.now();
   const ev = req.body;
-
   const actor = ev?.actor?.actor_type;
   const msg = ev?.data?.message || {};
   const typeMsg = msg.message_type || 'normal';
   const action = ev?.action;
-
-  const idConv  = getConvId(ev);
-  const chanId  = getChannelId(ev);
+  const idConv = getConvId(ev);
+  const chanId = getChannelId(ev);
   const groupId = getAssignedGroupId(ev);
-  const status  = getStatus(ev);
-  const cierre  = esCierre(ev);
+  const cierre = esCierre(ev);
 
-  /* Meta del evento */
-  const meta = { action, actor, typeMsg, idConv, chanId, groupId, status, cierre };
-  console.log('🛰️  meta:', meta);
-
-  /* Si parece evento de cierre, loguea payload completo para inspección */
-  if (cierre) {
-    try {
-      console.log('🧾  Payload (cierre):\n' + JSON.stringify(ev, null, 2));
-    } catch {
-      console.log('🧾  Payload (cierre): <no serializable>');
+  /* (A) Filtro temprano por canal si lo configuraste */
+  if (allowedChannels.size && chanId && !allowedChannels.has(chanId)) {
+    // Deja pasar únicamente si fuera un cierre válido por grupo (ver regla C abajo)
+    if (!(cierre && (!allowedGroups.size || (groupId && allowedGroups.has(groupId))))) {
+      console.log('🚫 Canal no permitido', { chanId, action, idConv });
+      return res.sendStatus(200);
     }
   }
 
   /* 1. Semilla → autoriza conversación */
   if (esSemilla(ev) && idConv) {
     allowList.add(idConv);
-    console.log('🌱  Semilla; autorizo conv', idConv, ' | allowList.size=', allowList.size);
+    console.log('🌱 Semilla; autorizo conv', idConv);
   }
 
   /* 2. Ver si la conversación está autorizada */
   const autorizada = idConv && allowList.has(idConv);
-  console.log('🔐  autorizada=', !!autorizada);
 
-  /* Permitir eventos de estado (conversation_update / _status) si la conv ya fue autorizada */
+  /* 3. Permitir eventos de estado (conversation_*) si la conv ya fue autorizada */
   const esEventoEstado = autorizada && action?.startsWith('conversation_');
-  if (esEventoEstado) {
-    console.log('ℹ️  Evento de estado permitido por estar autorizada:', action, idConv);
-  }
 
-  /* Permitir SIEMPRE el cierre, aunque la conv no esté autorizada (p.ej. reinicio del servicio) */
-  if (!autorizada && !esEventoEstado && !cierre) {
-    console.log('🚫  Descarto: conv no autorizada', { idConv, action, chanId, groupId, status });
+  /* (B) Bloquear nota privada del agente (no afecta mensajes al usuario) */
+  if (actor === 'agent' && typeMsg === 'private') {
+    console.log('🚫 Nota privada descartada', { idConv, action });
     return res.sendStatus(200);
   }
 
-  /* Si es cierre, limpia la allowList (higiene) */
-  if (cierre && idConv) {
-    allowList.delete(idConv);
-    console.log('🧹  Cierre detectado; borro de allowList', idConv, ' | allowList.size=', allowList.size);
+  /* (C) Regla de cierres:
+     - Pasa si la conv ya estaba autorizada
+     - O si cumple canal permitido y (si definiste grupos) grupo permitido
+     - Si no, se descarta el cierre “ajeno” (p. ej., otros canales) */
+  if (cierre) {
+    const canalOk = !allowedChannels.size || (chanId && allowedChannels.has(chanId));
+    const grupoOk = !allowedGroups.size || (groupId && allowedGroups.has(groupId));
+    if (!autorizada && !(canalOk && grupoOk)) {
+      console.log('🚫 Cierre descartado (no autorizado / canal-grupo no permitido)', {
+        idConv, chanId, groupId, action
+      });
+      return res.sendStatus(200);
+    }
+    if (idConv) {
+      allowList.delete(idConv); // higiene
+      console.log('🧹 Cierre detectado; borro de allowList', idConv);
+    }
   }
 
-  /* 3. Bloquear nota privada del agente */
-  if (actor === 'agent' && typeMsg === 'private') {
-    console.log('🚫  Nota privada descartada', { idConv, action });
+  /* (D) Regla general para no-cierres */
+  if (!cierre && !autorizada && !esEventoEstado) {
+    console.log('🚫 Descarto: conv no autorizada', idConv);
     return res.sendStatus(200);
   }
 
   /* 4. Reenviar a Botpress */
   try {
-    console.log('➡️  Reenviando a Botpress...', { bpUrlSet: !!BOTPRESS_URL, idConv, action });
-    const bpRes = await axios.post(BOTPRESS_URL, ev);
-    const ms = Date.now() - t0;
-    console.log('✅  Reenviado', { idConv, actor, typeMsg, action, status, bpStatus: bpRes?.status, ms });
+    await axios.post(BOTPRESS_URL, ev);
+    console.log('✅ Reenviado', { idConv, actor, typeMsg, action, chanId, groupId });
     res.sendStatus(200);
   } catch (e) {
-    const ms = Date.now() - t0;
-    console.error('❌  Error al reenviar:', e?.message || e, { idConv, action, ms });
+    console.error('❌ Error al reenviar:', e.message);
     res.sendStatus(500);
   }
 });
@@ -161,5 +159,5 @@ app.post('/webhook/freshchat', async (req, res) => {
 app.get('/', (_, res) => res.send('Filtro operativo ✅'));
 
 app.listen(3000, () =>
-  console.log('🚀  Proxy Freshchat → Botpress escuchando en 3000')
+  console.log('🚀 Proxy Freshchat → Botpress escuchando en 3000')
 );
